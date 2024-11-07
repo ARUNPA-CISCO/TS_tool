@@ -9,6 +9,7 @@ from time import strptime
 from datetime import datetime, timedelta
 from pathlib import Path
 from datetime import time
+import pandas as pd
 
 FTD_TROUBLESHOOT_PATH = ""
 FMC_TROUBLESHOOT_PATH = ""
@@ -247,6 +248,7 @@ def find_lines_between_timestamps(log_file, start_timestamp, end_timestamp, keyw
 # function to print logs from failed script
 def printLogs(stage, reason, package_folder, path):
     # build the path to the failed script
+    FTD_TS_PATH = path
     path += "/dir-archives/var-log/sf/"
     path += package_folder
     path += "/"
@@ -290,11 +292,23 @@ def printLogs(stage, reason, package_folder, path):
             print("Suggested Component: app_agent")
             return
 
+    with open(path, 'r') as file:
+        log_content = file.read()
+
+    if "000_00_run_cli_kick_start.sh" in failed_script:
+        if "Failed to patch app_bin of application directory" in log_content:
+            cisco_log_path = FTDTROUBLESHOOT_PATH + "/dir-archives/opt-cisco-csp-application-logs/cisco*.log"
+            cisco_log = glob.glob(cisco_log_path)
+            if os.path.exists(cisco_log):
+                with open(cisco_log, 'r') as file:
+                    cisco_log_content = file.read()
+                    if "failed to login to TAM service for app code" in cisco_log_content:
+                        print("Reason for failure: Failed to login to TAM service for app code sign: "
+                              "256-TAM_ERROR_NO_SESSION")
+                        print("Suggested Component: service-mgr")
+                        return
 
     if isinstance(comp_map, dict):
-        with open(path, 'r') as file:
-            log_content = file.read()
-
         for error, value in comp_map.items():
             if error in log_content:
                 component = value
@@ -619,7 +633,7 @@ def getJson(package_folder, path):
 
 
 def checkReadiness(package_folder, path):
-    path += "/dir-archives/var-log/sf"
+    path += "/dir-archives/var-log/sf/"
     path += package_folder
     os.chdir(path)
     print("Checking readiness from: " + path + "upgrade_readiness/upgrade_readiness_status.json")
@@ -658,28 +672,40 @@ def checkReadiness(package_folder, path):
 # function to retrieve timestamp when upgrade gets triggered on ftd
 def getUpgradeTriggerTimestamp():
     path = FTD_TROUBLESHOOT_PATH
-    path += "/dir-archives/var-log"
-    os.chdir(path)
-    print("Retrieving upgrade trigger timestamp for ftd from: " + path + "/action_queue.log")
-    action_queue_log = "action_queue.log"
 
-    f = open(action_queue_log, 'r')
-    timestamp = ""  # timestamp when upgrade gets triggered on ftd
-    status = ""
-    while True:
-        line = f.readline()
-        if not line:
-            break
-        # check for the necessary conditions
-        # Iterate back to actionq.1, .2 ... till we didn't receive "Apply Cisco"or check based on timestamp mysql_selectallfromaq
-        # optimize - reverse loop through the file
-        if "START TASK" in line and "Apply Cisco" in line and (
-                "Upgrade" in line or "Patch" in line) and "Initializing" in line:
-            timestamp = line[:15]
-            status = line.strip('\n')
+    pattern = re.compile(
+        r"aq_id:\s*(?P<aq_id>[^\s]+)\s+.*?"
+        r"description:\s*(?P<description>[\s\S]+?)\s"
+        r"\s*state:\s*(?P<state>\d+)\s+.*?"
+        r"create_time:\s*(?P<create_time>\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})",
+        re.DOTALL
+    )
 
-    print(status)
-    return timestamp
+    data = []
+    with open(FTD_TROUBLESHOOT_PATH+'/command-outputs/mysql.select_all_from_action_queue', 'r') as file:
+        entry_text = ""
+        for line in file:
+            entry_text += line
+            if "create_time:" in line:  # Assume entries end with "create_time:"
+                match = pattern.search(entry_text)
+                if match:
+                    entry = match.groupdict()
+                    if "Apply Cisco" in entry['description']:
+                        data.append(entry)
+                entry_text = ""
+
+    df = pd.DataFrame(data)
+
+    if not df.empty:
+        df['create_time'] = pd.to_datetime(df['create_time'], errors='coerce')
+        df = df.dropna(subset=['create_time'])
+        latest_entry = df.loc[df['create_time'].idxmax()]
+        print("Last Upgrade:\n", latest_entry)
+        status = latest_entry['description']
+        print(status)
+        return latest_entry
+    else:
+        print("No matching entries found.")
 
 
 def getAQIssue(path):
@@ -702,7 +728,8 @@ def getAQIssue(path):
 def main():
     # retrieve upgrade trigger time for ftd
     # how to identify the upg failures timestamp
-    trigger_time = getUpgradeTriggerTimestamp()
+    aq_data = getUpgradeTriggerTimestamp()
+    trigger_time = aq_data['create_time']
     if trigger_time == "":
         print("Upgrade isn't triggered on ftd")
         print("Suggested Component: fleet_upgrade")
@@ -723,9 +750,13 @@ def main():
     print("Retrieving most recent upgrade package from: " + path)
     dir_path = Path(os.getcwd())
 
+    # get version
+    pattern_version = r"\b\d+\.\d+\.\d"
+    version = re.search(pattern_version, aq_data['description'])
+
     # Use glob to filter directories with the pattern Cisco_FTD*
     path = sorted(
-        [p for p in dir_path.glob("Cisco_FTD*") if p.is_dir()],
+        [p for p in dir_path.glob("Cisco*"+version+"*") if p.is_dir()],
         key=lambda p: os.path.getmtime(str(p))
     )
     print(path)
@@ -782,7 +813,7 @@ def main():
         for line in reversed(lines):
             if "Confreg value: confreg =" in line:
                 confreg_value = line.split("confreg = ")[1].strip()
-                if confreg_value != "0x10001":
+                if confreg_value == "0x0":
                     print("Confreg value is not 0x10001, confreg_val= "+confreg_value)
                     print("Suggested Component: service-mgr")
                     return
@@ -801,6 +832,15 @@ def main():
         date1 = date(int(timestamp[0]), int(timestamp[1]), int(timestamp[2]))
         time1 = time(int(timestamp[3]), int(timestamp[4]), int(timestamp[5]))
         print("Timestamp from main_upgrade_script.log: ", date1, time1)
+
+        asa_console = FTD_TROUBLESHOOT_PATH+"/dir-archives/var-log/ASAconsole.log"
+        if os.path.exists(asa_console):
+            with open(asa_console, 'r') as file:
+                lines = file.readlines()
+                if "Memory allocation failed for Regular ACL" in lines:
+                    print("Memory allocation failed for Regular ACL")
+                    print("Suggested Component: access-list")
+                    return
 
         value = checkFMCStatus(date1, time1, status[7])
         timestamp = value[0]
