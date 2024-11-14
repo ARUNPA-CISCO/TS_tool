@@ -10,6 +10,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from datetime import time
 import pandas as pd
+import gzip
 
 FTD_TROUBLESHOOT_PATH = ""
 FMC_TROUBLESHOOT_PATH = ""
@@ -20,7 +21,7 @@ component_map = {
     "000_start": {
         "000_start/000_00_run_cli_kick_start.sh": "ftd_upgrade",
         "000_start/000_00_run_troubleshoot.sh": "ftd_upgrade",
-        "000_start/000_0_start_upgrade_status_api_stack.sh": "ftd_onbox", # update confluence
+        "000_start/000_0_start_upgrade_status_api_stack.sh": "ftd_onbox",  # update confluence
         "000_start/000_check_platform_support.sh": "ftd_upgrade",
         "000_start/000_check_update.sh": "ftd_upgrade",
         "000_start/000_db_schema_check.sh": "fmc_upgrade",
@@ -29,19 +30,40 @@ component_map = {
             "Could not connect to MariaDB.": "db_mariadb",
             "Failed when preparing statement": "db_mariadb",
             "Can't execute statement": "db_mariadb",
+            "failed: unable to open database file": "config_dispatcher",
             "all": "ftd_upgrade"
         },
         "000_start/105_check_model_number.sh": "ftd_upgrade",
         "000_start/106_check_HA_state.pl": "Project: CSC.netbu, Product: pix-asa, Component: ha",
         "000_start/106_check_HA_updates.pl": "dc_ha",
-        "000_start/107_version_check.sh": "ftd_upgrade",
+        "000_start/107_version_check.sh": {
+            "This install requires a minimum FXOS version": "firmware",
+            "all": "ftd_upgrade"
+        },
         "000_start/108_clean_user_stale_entries.pl": "fmc-auth",
         "000_start/110_DB_integrity_check.sh": "db_framework",
         "000_start/113_EO_integrity_check.pl": "enterprise_obj_fw",
         "000_start/200_clean_csp_files.sh": "platform_support",
         "000_start/250_check_system_files.sh": "ftd_upgrade",
         "000_start/320_remove_backups.sh": "ftd_upgrade",
-        "000_start/410_check_disk_space.sh": "ftd_upgrade"
+        "000_start/990_check_disk_space.sh": "ftd_upgrade",
+        "000_start/410_check_disk_space.sh": "ftd_upgrade",
+        "000_start/801_check_reg.pl": {
+            "Process Manager is not up. Cannot continue.": "os_packages",
+            "Device registration in progress.": "ftd_registration"
+        },
+        "000_start/802_check_mounts.sh": "fmc_upgrade",
+        "000_start/803_check_deploy_package.pl": "policy_apply",
+        "000_start/804_check_manager.pl": {
+            "upgrade version is higher than FMC": "fleet_upgrade",
+            "all": "ftd_upgrade"
+        },
+        "000_start/805_check_snort.sh": "ftd_upgrade",
+        "000_start/806_check_sru_install.sh": "sru_install",
+        "000_start/807_check_snort_preproc.sh": "sru_install",
+        "000_start/815_verify_rpm.sh": "ftd_upgrade",
+        "000_start/900_check_dashboards.pl": "dashboard-ui",
+        "000_start/952_save_etc_sf.sh": "ftd_upgrade"
     },
     "200_pre": {
         "200_pre/001_check_reg.pl": {
@@ -50,7 +72,10 @@ component_map = {
         },
         "200_pre/002_check_mounts.sh": "fmc_upgrade",
         "200_pre/004_check_deploy_package.pl": "policy_apply",
-        "200_pre/005_check_manager.pl": "ftd_upgrade",
+        "200_pre/005_check_manager.pl": {
+            "upgrade version is higher than FMC": "fleet_upgrade",
+            "all": "ftd_upgrade"
+        },
         "200_pre/006_check_snort.sh": "ftd_upgrade",
         "200_pre/007_check_sru_install.sh": "sru_install",
         "200_pre/009_check_snort_preproc.sh": "sru_install",
@@ -62,7 +87,10 @@ component_map = {
         "200_pre/120_generate_auth_for_upgrade_ui.pl": "fmc_upgrade",
         "200_pre/152_save_etc_sf.sh": "ftd_upgrade",
         "200_pre/199_before_maintenance_mode.sh": "ftd_upgrade",
-        "200_pre/200_enable_maintenance_mode.pl": "Project: CSC.netbu, Product: pix-asa, Component: ha",
+        "200_pre/200_enable_maintenance_mode.pl": {
+            "Other node is not able to join cluster.": "clustering",
+            "all": "Project: CSC.netbu, Product: pix-asa, Component: ha",
+        },
         "200_pre/202_disable_syncd.sh": "ftd_upgrade",
         "200_pre/400_restrict_rpc.sh": "ftd_upgrade",
         "200_pre/500_stop_system.sh": "ftd_upgrade",
@@ -111,7 +139,7 @@ component_map = {
         "500_rpms/550_configure_mysql.pl": "db_mariadb",
         "500_rpms/800_update_slackpackages_ftd.sh": {
             "Linux kernel packages for FTD is not expected.": "os_packages",
-            "all": "ftd_upgrade"
+            "all": "ftd_upgrade"  # check for triaging things.
         }
     },
     "600_schema": {
@@ -245,6 +273,17 @@ def find_lines_between_timestamps(log_file, start_timestamp, end_timestamp, keyw
     return result_lines
 
 
+def parse_size(size_str):
+    if size_str.endswith('G'):
+        return float(size_str[:-1]) * 1024
+    elif size_str.endswith('M'):
+        return float(size_str[:-1])
+    elif size_str.endswith('K'):
+        return float(size_str[:-1]) / 1024
+    else:
+        return 0
+
+
 # function to print logs from failed script
 def printLogs(stage, reason, package_folder, path):
     # build the path to the failed script
@@ -273,7 +312,7 @@ def printLogs(stage, reason, package_folder, path):
                 if "verify failed" in line:
                     print(line)
                     if "lsp" in line:
-                        print("Suggested Component: lsp")
+                        print("Suggested Component: policy_apply")
                     elif "appid" in line or "navl" in line or "vdb" in line or "mercury" in line:
                         print("Suggested Component: vdb")
                     elif "snort" in line:
@@ -283,7 +322,8 @@ def printLogs(stage, reason, package_folder, path):
                     break
         return
     elif "200_enable_maintenance_mode.pl" in failed_script:
-        ngfwManagerlogpath = path.replace("sf/" + package_folder + "200_pre/200_enable_maintenance_mode.pl", "ngfwManager.log")
+        ngfwManagerlogpath = path.replace("sf/" + package_folder + "200_pre/200_enable_maintenance_mode.pl",
+                                          "ngfwManager.log")
         with open(ngfwManagerlogpath, 'r') as file:
             ngfw_manager = file.read()
 
@@ -297,7 +337,7 @@ def printLogs(stage, reason, package_folder, path):
 
     if "000_00_run_cli_kick_start.sh" in failed_script:
         if "Failed to patch app_bin of application directory" in log_content:
-            cisco_log_path = FTDTROUBLESHOOT_PATH + "/dir-archives/opt-cisco-csp-application-logs/cisco*.log"
+            cisco_log_path = FTD_TS_PATH + "/dir-archives/opt-cisco-csp-application-logs/cisco*.log"
             cisco_log = glob.glob(cisco_log_path)
             if os.path.exists(cisco_log):
                 with open(cisco_log, 'r') as file:
@@ -318,7 +358,6 @@ def printLogs(stage, reason, package_folder, path):
     else:
         component = comp_map
 
-    # retrieve last 10 logs from failed script
     f = open(path, 'r')
     while True:
         line = f.readline()
@@ -344,10 +383,9 @@ def checkIssues(date1, time1, date2, time2, path):
 
     messages_log = "messages"
     flag = 0
-    error_strings = ["HMAC verification reached timeout", "Failed to connect to tunnel", "ShutDownPeer"]
-    f = open(messages_log, 'r')
-    while True:
-        line = f.readline()
+    error_strings = []  # comms.log, ip, timestamp, lookup from end, sftunnel-status - Ask Kishore
+    # Environment issues
+    for line in reverse_readline(messages_log):
         if not line:
             break
         for error_string in error_strings:
@@ -670,19 +708,23 @@ def checkReadiness(package_folder, path):
 
 
 # function to retrieve timestamp when upgrade gets triggered on ftd
-def getUpgradeTriggerTimestamp():
-    path = FTD_TROUBLESHOOT_PATH
+def getUpgradeTriggerTimestamp(troubleshoot_path, uuid):
+    path = troubleshoot_path
 
     pattern = re.compile(
         r"aq_id:\s*(?P<aq_id>[^\s]+)\s+.*?"
         r"description:\s*(?P<description>[\s\S]+?)\s"
-        r"\s*state:\s*(?P<state>\d+)\s+.*?"
+        r"last_state_change:\s*(?P<last_state_change>[\s\S]+?)(?=\s*(state:|message:|coderef:|\Z))"
+        r"state:\s*(?P<state>\d+)\s+.*?"
+        r"message:\s*(?P<message>[\s\S]+?)\s"
+        r"arguments:\s*(?P<arguments>[\s\S]+?)\s"
+        r"target:\s*(?P<target>[\s\S]+?)\s"
         r"create_time:\s*(?P<create_time>\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})",
         re.DOTALL
     )
 
     data = []
-    with open(FTD_TROUBLESHOOT_PATH+'/command-outputs/mysql.select_all_from_action_queue', 'r') as file:
+    with open(FTD_TROUBLESHOOT_PATH + '/command-outputs/mysql.select_all_from_action_queue', 'r') as file:
         entry_text = ""
         for line in file:
             entry_text += line
@@ -691,6 +733,25 @@ def getUpgradeTriggerTimestamp():
                 if match:
                     entry = match.groupdict()
                     if "Apply Cisco" in entry['description']:
+                        if entry['message']:
+                            entry['message'] = re.split(r'\s*coderef:|\s*create_time:|\s*state:', entry['message'])[
+                                0].strip()
+                        if entry['arguments']:
+                            # true - diskspace issue, else false
+                            cleaned_argument = re.sub(r'[^\x20-\x7E]', '', entry['arguments'])
+                            entry[
+                                'arguments'] = 'Not enough disk space available' in cleaned_argument or 'Not enough ' \
+                                                                                                        'disk space ' \
+                                                                                                        'available' \
+                                               in \
+                                               entry['message']
+                        if entry.get('target'):
+                            entry['target'] = re.split(r'\s*retry_type:|\s*create_time:|\s*state:', entry['target'])[
+                                0].strip()
+                        if entry.get('last_state_change'):
+                            entry['last_state_change'] = \
+                                re.split(r'\s*retry_type:|\s*create_time:|\s*state:', entry['last_state_change'])[
+                                    0].strip()
                         data.append(entry)
                 entry_text = ""
 
@@ -699,47 +760,317 @@ def getUpgradeTriggerTimestamp():
     if not df.empty:
         df['create_time'] = pd.to_datetime(df['create_time'], errors='coerce')
         df = df.dropna(subset=['create_time'])
-        latest_entry = df.loc[df['create_time'].idxmax()]
-        print("Last Upgrade:\n", latest_entry)
-        status = latest_entry['description']
-        print(status)
-        return latest_entry
+
+        if uuid:
+            df = df[df['target'] == uuid]
+
+        if not df.empty:
+            latest_entry = df.loc[df['create_time'].idxmax()]
+            print("Last Upgrade info:\n", latest_entry)
+            status = latest_entry['description']
+            print("Status:", status)
+            return latest_entry
+        else:
+            print("No matching entries found for the specified UUID.")
     else:
         print("No matching entries found.")
+    return None
 
 
-def getAQIssue(path):
-    path += "/dir-archives/var-log"
-    os.chdir(path)
-    print("Checking for disk space issues from: " + path + "/action_queue.log")
-    disk_space_log = "action_queue.log"
-    with open(disk_space_log, 'r') as file:
+def binary_search_log(file_path, start_time):
+    with open_log(file_path) as file:
         lines = file.readlines()
-    # check command output for disk space issues and get the component name.
-    for line in reversed(lines):
-        if "Not enough disk space available" in line:
-            print("Disk space check failed")
-            print("Suggested Component: ftd_upgrade")
-            return 1
-    print("Disk space check successful")
-    return 0
+
+    first_line = lines[1]
+    try:
+        timestamp_str = ' '.join(first_line.split()[0:3])
+        first_log_time = datetime.strptime(f"{start_time.year} {timestamp_str}", "%Y %b %d %H:%M:%S")
+    except (ValueError, IndexError):
+        return -1
+    if first_log_time > start_time:
+        return -1
+
+    low, high = 0, len(lines) - 1
+    while low <= high:
+        mid = (low + high) // 2
+        line = lines[mid]
+        try:
+            timestamp_str = ' '.join(line.split()[0:3])
+            # Expects line will contain the timestamp
+            log_time = datetime.strptime(f"{start_time.year} {timestamp_str}", "%Y %b %d %H:%M:%S")
+        except (ValueError, IndexError):
+            continue
+
+        if log_time < start_time:
+            low = mid + 1
+        elif log_time > start_time:
+            high = mid - 1
+        else:
+            return mid
+
+    return low
+
+
+def open_log(file_path):
+    if file_path.endswith('.gz'):
+        return gzip.open(file_path, 'rt')
+    else:
+        return open(file_path, 'r')
+
+
+def getDiskSpaceIssue(path, package_folder, start_timestamp, end_timestamp):
+    path += "/dir-archives/var-log"
+    # 410_disk_space_check.sh
+    patterns = {
+        "policy_apply": r"/ngfw/var/cisco/deploy/pkg/var/sf/lsp/active-lsp/lsp-rel-.*",
+        "sru": r"/ngfw/var/cisco/deploy/pkg/var/cisco/packages/sru.*",
+        "snort": r"/var/sf/detection_engines/.*/instance-.*/(archive|backup)"
+    }
+
+    component_data = {
+        "policy_apply": {"size": 0, "paths": []},
+        "sru": {"size": 0, "paths": []},
+        "snort": {"size": 0, "paths": []}
+    }
+    if package_folder != "":
+        log_content = path + "/sf/" + package_folder + "/000_start/410_check_disk_space.sh.log"
+        with open(log_content, 'r') as file:
+            for line in file:
+                match = re.match(r"(\d+\S+)\s+(.+)", line.strip())
+                if match:
+                    size_str, path = match.groups()
+                    size_in_mb = parse_size(size_str)
+
+                    for component, pattern in patterns.items():
+                        if re.match(pattern, path):
+                            component_data[component]["size"] += size_in_mb
+                            component_data[component]["paths"].append(path)
+                            break
+    # ActionQueue Log
+    else:
+        start_time = datetime.strptime(start_timestamp, "%Y-%m-%d %H:%M:%S")
+        end_time = datetime.strptime(end_timestamp, "%Y-%m-%d %H:%M:%S")
+        log_number = 0
+        while True:
+            file_path = f"{path}/action_queue.log" + (f".{log_number}.gz" if log_number > 0 else "")
+
+            if not os.path.exists(file_path):
+                break
+            start_index = binary_search_log(file_path, start_time)
+            if start_index == -1:
+                log_number += 1
+                continue
+            with open_log(file_path) as file:
+                lines = file.readlines()
+                in_section = False
+                for i in range(start_index, len(lines)):
+                    line = lines[i]
+                    try:
+                        timestamp_str = ' '.join(line.split()[0:3])
+                        current_time = datetime.strptime(f"{start_time.year} {timestamp_str}", "%Y %b %d %H:%M:%S")
+                    except (ValueError, IndexError):
+                        continue
+                    if current_time > end_time:
+                        return
+                    if "----------------------------------------------------------------------" in line:
+                        in_section = not in_section
+                        continue
+                    if in_section:
+                        match = re.match(r".*\s+(\d+[MGK]?)\s+(.+)$", line.strip())
+                        if match:
+                            size_str, path = match.groups()
+                            size_in_mb = parse_size(size_str)
+
+                            for component, pattern in patterns.items():
+                                if re.match(pattern, path):
+                                    component_data[component]["size"] += size_in_mb
+                                    component_data[component]["paths"].append(path)
+                                    break
+            log_number += 1
+
+    for component, data in component_data.items():
+        print(f"{component} size: {data['size']:.2f} MB")
+        print(f"{component} files matched:")
+        for path in data["paths"]:
+            print(f" - {path}")
+        print()
+
+    largest_component = max(component_data, key=lambda comp: component_data[comp]["size"])
+    largest_size = component_data[largest_component]["size"]
+
+    print(f"'{largest_component}' is taking most space - {largest_size:.2f} MB.")
+    print("Suggested Component: ", largest_component)
+    return
+
+
+def check_log_for_errors(log_file, start_timestamp, end_timestamp, error_strings):
+    start_time = datetime.strptime(start_timestamp, "%Y-%m-%d %H:%M:%S")
+    end_time = datetime.strptime(end_timestamp, "%Y-%m-%d %H:%M:%S")
+
+    for line in reverse_readline(log_file):
+        timestamp_match = re.match(r"(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})", line)
+        if timestamp_match:
+            log_timestamp = datetime.strptime(timestamp_match.group(1), "%Y-%m-%d %H:%M:%S")
+            if log_timestamp < start_time:
+                return 1
+                break
+            if start_time <= log_timestamp <= end_time:
+                for error_string in error_strings:
+                    if error_string in line:
+                        print(f"Start Timestamp: {start_timestamp}")
+                        print(f"End Timestamp: {end_timestamp}")
+                        print(f"Error Line: {line.strip()}")
+                        if "core.lina" in log_file:
+                            return 1
+                        if "core.sshd" in log_file:
+                            return 2
+                        print("-" * 80)
+                        return 0
+    return 1
+
+
+def checkdeploymentpostupgrade(log_file, start_timestamp, end_timestamp, error_strings):
+    start_time = datetime.strptime(start_timestamp, "%Y-%m-%d %H:%M:%S")
+    end_time = datetime.strptime(end_timestamp, "%Y-%m-%d %H:%M:%S")
+
+    for line in reverse_readline(log_file):
+        timestamp_match = re.match(r"(\d{2}-\w{3}-\d{4} \d{2}:\d{2}:\d{2}\.\d{3})", line)
+        if timestamp_match:
+            log_timestamp = datetime.strptime(timestamp_match.group(1), "%Y-%m-%d %H:%M:%S")
+            if log_timestamp < start_time:
+                return 1
+                break
+            if start_time <= log_timestamp <= end_time:
+                if error_strings[0] in line and error_strings[1] in line:
+                    return 0
+    return 1
+
+
+def checksftunnel_status(path, start_timestamp, end_timestamp):
+    error_strings = ["HMAC verification reached timeout", "ShutDownPeer"]
+    if os.path.exists(path + "/dir-archives/var-log/comms.log"):
+        if check_log_for_errors(path + "/dir-archives/var-log/comms.log", start_timestamp, end_timestamp,
+                                error_strings) == 0:
+            print("Suggested Component: comms")
+            return 0
+    elif os.path.exists(path + "/dir-archives/var-log/messages"):
+        if check_log_for_errors(path + "/dir-archives/var-log/messages", start_timestamp, end_timestamp,
+                                error_strings) == 0:
+            print("Suggested Component: comms")
+            return 0
+    return 1
+
+
+def reverse_readline(filename, buf_size=8192):
+    with open(filename, 'rb') as fh:
+        segment = None
+        offset = 0
+        fh.seek(0, os.SEEK_END)
+        file_size = remaining_size = fh.tell()
+        while remaining_size > 0:
+            offset = min(file_size, offset + buf_size)
+            fh.seek(file_size - offset)
+            buffer = fh.read(min(remaining_size, buf_size))
+            if remaining_size == file_size and buffer[-1] == ord('\n'):
+                buffer = buffer[:-1]
+            remaining_size -= buf_size
+            lines = buffer.split('\n'.encode())
+            if segment is not None:
+                lines[-1] += segment
+            segment = lines[0]
+            lines = lines[1:]
+            for line in reversed(lines):
+                yield line.decode()
+        if segment is not None:
+            yield segment.decode()
 
 
 def main():
     # retrieve upgrade trigger time for ftd
     # how to identify the upg failures timestamp
-    aq_data = getUpgradeTriggerTimestamp()
-    trigger_time = aq_data['create_time']
-    if trigger_time == "":
+    # verify TS and check managers
+    with open(FTD_TROUBLESHOOT_PATH + '/command-outputs/usr-local-sf-bin-sfcli.pl show managers.output', 'r') as file:
+        lines = file.readlines()
+
+    is_fmc_managed = False
+    is_fdm_managed = False
+    no_manager_configured = False
+    if "Managed locally" in lines:
+        is_fdm_managed = True
+    elif "No Managers Configured" in lines:
+        no_manager_configured = True
+    else:
+        is_fmc_managed = True
+
+    if is_fmc_managed:
+        ims_conf_path = FMC_TROUBLESHOOT_PATH + "/dir-archives/etc/sf/ims.conf"
+        peers_map = FTD_TROUBLESHOOT_PATH + "/dir-archives/var-sf-peers/PEERS_MAP.JSON"
+        if os.path.exists(ims_conf_path):
+            with open(ims_conf_path, 'r') as file:
+                for line in file:
+                    if "APPLIANCE_UUID" in line:
+                        appliance_uuid_fmc = line.split("=")[1].strip()
+                        if os.path.exists(peers_map):
+                            with open(peers_map, 'r') as file1:
+                                peers_data = json.load(file1)
+                            if appliance_uuid_fmc not in peers_data:
+                                print("Either device is not managed by FMC or TS is not correct")
+                                print("Manager: ", peers_data[appliance_uuid_fmc])
+                                break
+                        break
+
+    if no_manager_configured:
+        print("No Managers Configured, please register device to a manager and try again.")
+        print("Suggested Component: Junk")
+        return
+
+    # Verify Last upgrade package verification
+    for line in reverse_readline(FTD_TROUBLESHOOT_PATH + '/dir-archives/var-log/sf/verify_signature.log'):
+        if "Successfully verified signature of image" in line:
+            print("Last upgrade package is successfully verified signature.")
+            break
+        elif "Failed to verify signature of bundle image." in line:
+            if "DEV" in line:
+                if not os.path.exists(FTD_TROUBLESHOOT_PATH + "/dir-archives/etc/certs/dev.crt"):
+                    print("Dev certificate not present, please install the dev.crt to /ngfw/etc/certs and try again.")
+                    print("Suggested Component: Junk")
+                    return
+                else:
+                    print("Failed to verify signature of bundle image.")
+                    print("Suggested Component: ftd_upgrade")
+                    return
+
+    aq_data_ftd = getUpgradeTriggerTimestamp(FTD_TROUBLESHOOT_PATH, None)
+    ims_conf_ftd = FTD_TROUBLESHOOT_PATH + "/dir-archives/etc/sf/ims.conf"
+    if os.path.exists(ims_conf_ftd):
+        with open(ims_conf_ftd, 'r') as file:
+            for line in file:
+                if "APPLIANCE_UUID" in line:
+                    appliance_uuid = line.split("=")[1].strip()
+                    aq_data_fmc = getUpgradeTriggerTimestamp(FMC_TROUBLESHOOT_PATH, appliance_uuid)
+
+    if aq_data_ftd is None:
+        if aq_data_fmc is None:
+            print("Upgrade triggered info not present in FMC")
+            print("Looks like upgrade isn't triggered on FTD")
+            print("Suggested Component: fleet_upgrade")
+            return
+        if aq_data_fmc['message']:
+            print(aq_data_fmc['message'])
+        if checksftunnel_status(FTD_TROUBLESHOOT_PATH, aq_data_fmc['create_time'],
+                                aq_data_fmc['last_state_change']) == 0:
+            print("Suggested Component: comms")
+            return
         print("Upgrade isn't triggered on ftd")
         print("Suggested Component: fleet_upgrade")
         return
-    print("Upgrade triggered on ftd at: ", trigger_time)
 
-    # Check for disk space issues.
-    path = FTD_TROUBLESHOOT_PATH
-    if getAQIssue(path) == 1:
-        return
+    trigger_time_ftd = aq_data_ftd['create_time']
+    end_time_ftd = aq_data_ftd['last_state_change']
+
+    if aq_data_fmc is not None:
+        trigger_time_fmc = aq_data_fmc['create_time']
+        end_time_fmc = aq_data_fmc['last_state_change']
 
     # for multiple upgrade scenario, pick most recent one
     upgrade_package = "Cisco_FTD"
@@ -752,11 +1083,12 @@ def main():
 
     # get version
     pattern_version = r"\b\d+\.\d+\.\d"
-    version = re.search(pattern_version, aq_data['description'])
+    version = re.search(pattern_version, aq_data_ftd['description'])
+    version = version.group(0)
 
-    # Use glob to filter directories with the pattern Cisco_FTD*
+    # Use glob to filter directories with the pattern Cisco*
     path = sorted(
-        [p for p in dir_path.glob("Cisco*"+version+"*") if p.is_dir()],
+        [p for p in dir_path.glob("Cisco*" + version + "*") if p.is_dir()],
         key=lambda p: os.path.getmtime(str(p))
     )
     print(path)
@@ -769,8 +1101,17 @@ def main():
         if path_string[ind + 1:].startswith(upgrade_package) and ("Upgrade" in path_string or "Patch" in path_string):
             package_folder = path_string[ind + 1:]
 
+    # Check for disk space issue
+    path = FTD_TROUBLESHOOT_PATH
+    if aq_data_ftd['arguments']:
+        getDiskSpaceIssue(path, package_folder, trigger_time_ftd, end_time_ftd)
+        return
+
     if package_folder == "":
-        print("FTD Upgrade package not present")
+        print("Script execution didn't started")
+        if aq_data_ftd['message']:
+            print(aq_data_ftd['message'])
+            print("Suggested Component: ftd_upgrade")
         return
 
     print("FTD Upgrade package: ", package_folder)
@@ -787,15 +1128,10 @@ def main():
     status = getJson(package_folder, path)
 
     if len(status) == 0:
+        print("Upgrade status not present in upgrade_status.json")
+        print("Suggested Component: ftd_upgrade")
         return
 
-    # Check for dev.crt
-    if "DEV" in status[9]:
-        if not os.path.exists(FTD_TROUBLESHOOT_PATH + "/dir-archives/etc/certs/dev.crt"):
-            print("Dev certificate not present")
-            print("Suggested Component: Junk")
-            return
-##s
     # Get the last string in the upgrade_status.log
     file_path_log = FTD_TROUBLESHOOT_PATH + "/dir-archives/var-log/sf/" + package_folder + "/upgrade_status.log"
     with open(file_path_log, 'r') as file:
@@ -814,8 +1150,8 @@ def main():
             if "Confreg value: confreg =" in line:
                 confreg_value = line.split("confreg = ")[1].strip()
                 if confreg_value == "0x0":
-                    print("Confreg value is not 0x10001, confreg_val= "+confreg_value)
-                    print("Suggested Component: service-mgr")
+                    print("Confreg value is 0x0, confreg_val= " + confreg_value + ". This will hinder auto-boot")
+                    print("Suggested Component: Junk")
                     return
 
     # when upgrade status isn't FAILED
@@ -833,9 +1169,9 @@ def main():
         time1 = time(int(timestamp[3]), int(timestamp[4]), int(timestamp[5]))
         print("Timestamp from main_upgrade_script.log: ", date1, time1)
 
-        asa_console = FTD_TROUBLESHOOT_PATH+"/dir-archives/var-log/ASAconsole.log"
+        asa_console = FTD_TROUBLESHOOT_PATH + "/dir-archives/var-log/ASAconsole.log"
         if os.path.exists(asa_console):
-            with open(asa_console, 'r') as file:
+            with open(asa_console, 'r') as file:  # Timestamp
                 lines = file.readlines()
                 if "Memory allocation failed for Regular ACL" in lines:
                     print("Memory allocation failed for Regular ACL")
@@ -866,28 +1202,31 @@ def main():
                     print("Suggested Component: fleet_upgrade")
             return
 
+        deployment_file = FMC_TROUBLESHOOT_PATH+"/dir-archives/var-opt-CSCOpx-MDC-log-operation/usmsharedsvcs.log"
+        if checkdeploymentpostupgrade(deployment_file, date1 + " " + time1, end_time_fmc, [appliance_uuid, "failed"]) == 0:
+            print("Deployment failed post upgrade")
+            print("Suggested Component: policy_apply")
+            return
+
         return
 
     if "The upgrade was interrupted by a system restart." in status[6]:
         print("System restart interrupted the upgrade")
-        if os.path.exists(FTD_TROUBLESHOOT_PATH+"/dir-archives/opt-cisco-platform-logs/prune_cores.log"):
-            prune_core_log = FTD_TROUBLESHOOT_PATH+"/dir-archives/opt-cisco-platform-logs/prune_cores.log"
-            with open(prune_core_log, 'r') as file:
-                corelines = file.readlines()
-            for line in reversed(corelines):
-                if "core.sshd" in line:
-                    print("SSHD Core dump found")
-                    print("Suggested Component: asa, ssh")
-                    return
-                elif "core.lina" in line:
-                    print("Lina Core dump found")
-                    print("Suggested Component: asa")
-                    return
-            print("No core dumps found")
-            print("Suggested Component: ftd_upgrade")
+        if os.path.exists(FTD_TROUBLESHOOT_PATH + "/dir-archives/opt-cisco-platform-logs/prune_cores.log"):
+            prune_core_log = FTD_TROUBLESHOOT_PATH + "/dir-archives/opt-cisco-platform-logs/prune_cores.log"
+            error_strings = ["core.lina", "core.sshd"]
+            core = check_log_for_errors(prune_core_log, trigger_time_ftd, end_time_ftd, error_strings)
+            if core == 1:
+                print("Suggested Component: asa")
+                print("To further identify the issue, collect core file from the device and upload to autopsy.")
+                print("Share the autopsy report with Lina team to understand the root cause and to identify the "
+                      "component.")
+                return
+            elif core == 2:
+                print("Suggested Component: sshd")
+                return
         print("Suggested Component: ftd_upgrade")
         return
-    print("Suggested Component: ftd_upgrade")
 
     # when upgrade status is FAILED
     if len(status[5]) > 0:
