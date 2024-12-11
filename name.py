@@ -327,7 +327,7 @@ def printLogs(stage, reason, package_folder, path):
         with open(ngfwManagerlogpath, 'r') as file:
             ngfw_manager = file.read()
 
-        if "line protocol is down >>>>>>>> Failover ifc's both admin and protocol are DOWN" in ngfw_manager:
+        if "line protocol is down >>>>>>>> Failover ifc's both admin and protocol are DOWN" in ngfw_manager:  # add timestamp
             print("Reason for failure: Failover ifc's both admin and protocol are DOWN")
             print("Suggested Component: app_agent")
             return
@@ -606,7 +606,7 @@ def checkDatabase(path):
                         print("Suggested Component: ", process_name)
                     return 0
 
-        if "Device successfully upgraded" in line or "Update Installed successfully" in line:
+        if "Device successfully upgraded" in line or "Update Installed successfully" in line:  # check from mysql_selectallfromaq
             device_upgraded = 1
             break
 
@@ -823,9 +823,10 @@ def getDiskSpaceIssue(path, package_folder, start_timestamp, end_timestamp):
     # 410_disk_space_check.sh
     patterns = {
         "policy_apply": r"/ngfw/var/cisco/deploy/pkg/var/sf/lsp/active-lsp/lsp-rel-.*",
-        "sru": r"/ngfw/var/cisco/deploy/pkg/var/cisco/packages/sru.*",
+        "sru": r"/ngfw/var/sf/SRU/cisco_SRU*",
         "snort": r"/var/sf/detection_engines/.*/instance-.*/(archive|backup)"
-    }
+        # - Gigabits of space for file and if it greater than largest one show that xtls_log*
+    }  # Check for more than $perc% to total-diskspace available
 
     component_data = {
         "policy_apply": {"size": 0, "paths": []},
@@ -949,7 +950,8 @@ def checkdeploymentpostupgrade(log_file, start_timestamp, end_timestamp, error_s
 def checksftunnel_status(path, start_timestamp, end_timestamp):
     error_strings = ["HMAC verification reached timeout", "ShutDownPeer"]
     if os.path.exists(path + "/dir-archives/var-log/comms.log"):
-        if check_log_for_errors(path + "/dir-archives/var-log/comms.log", start_timestamp, end_timestamp,
+        if check_log_for_errors(path + "/dir-archives/var-log/"
+                                       "comms.log", start_timestamp, end_timestamp,
                                 error_strings) == 0:
             print("Suggested Component: comms")
             return 0
@@ -1007,9 +1009,9 @@ def main():
         peers_map = FTD_TROUBLESHOOT_PATH + "/dir-archives/var-sf-peers/PEERS_MAP.JSON"
         if os.path.exists(ims_conf_path):
             with open(ims_conf_path, 'r') as file:
-                for line in file:
-                    if "APPLIANCE_UUID" in line:
-                        appliance_uuid_fmc = line.split("=")[1].strip()
+                for line1 in file:
+                    if "APPLIANCE_UUID" in line1:
+                        appliance_uuid_fmc = line1.split("=")[1].strip()
                         if os.path.exists(peers_map):
                             with open(peers_map, 'r') as file1:
                                 peers_data = json.load(file1)
@@ -1025,20 +1027,23 @@ def main():
         return
 
     # Verify Last upgrade package verification
-    for line in reverse_readline(FTD_TROUBLESHOOT_PATH + '/dir-archives/var-log/sf/verify_signature.log'):
-        if "Successfully verified signature of image" in line:
+    flag = 0
+    for line1 in reverse_readline(FTD_TROUBLESHOOT_PATH + '/dir-archives/var-log/sf/verify_signature.log'):
+        if "Successfully verified signature of image" in line1 and ("Cisco_FTD" in line1 or "Cisco_Secure" in line1):
+            flag = 1
             print("Last upgrade package is successfully verified signature.")
             break
-        elif "Failed to verify signature of bundle image." in line:
-            if "DEV" in line:
-                if not os.path.exists(FTD_TROUBLESHOOT_PATH + "/dir-archives/etc/certs/dev.crt"):
-                    print("Dev certificate not present, please install the dev.crt to /ngfw/etc/certs and try again.")
-                    print("Suggested Component: Junk")
-                    return
-                else:
-                    print("Failed to verify signature of bundle image.")
-                    print("Suggested Component: ftd_upgrade")
-                    return
+
+    if flag == 0:
+        if "DEV" in line1:
+            if not os.path.exists(FTD_TROUBLESHOOT_PATH + "/dir-archives/etc/certs/dev.crt"):
+                print("Dev certificate not present, please install the dev.crt to /ngfw/etc/certs and try again.")
+                print("Suggested Component: Junk")
+                return
+            else:
+                print("Failed to verify signature of bundle image.")
+                print("Suggested Component: ftd_upgrade")
+                return
 
     aq_data_ftd = getUpgradeTriggerTimestamp(FTD_TROUBLESHOOT_PATH, None)
     ims_conf_ftd = FTD_TROUBLESHOOT_PATH + "/dir-archives/etc/sf/ims.conf"
@@ -1047,28 +1052,30 @@ def main():
             for line in file:
                 if "APPLIANCE_UUID" in line:
                     appliance_uuid = line.split("=")[1].strip()
-                    aq_data_fmc = getUpgradeTriggerTimestamp(FMC_TROUBLESHOOT_PATH, appliance_uuid)
+                    if is_fmc_managed:
+                        aq_data_fmc = getUpgradeTriggerTimestamp(FMC_TROUBLESHOOT_PATH, appliance_uuid)
 
-    if aq_data_ftd is None:
-        if aq_data_fmc is None:
-            print("Upgrade triggered info not present in FMC")
-            print("Looks like upgrade isn't triggered on FTD")
+    if is_fmc_managed:
+        if aq_data_ftd is None:
+            if aq_data_fmc is None:
+                print("Upgrade triggered info not present in FMC")
+                print("Looks like upgrade isn't triggered on FTD")
+                print("Suggested Component: fleet_upgrade")
+                return
+            if aq_data_fmc['message']:
+                print(aq_data_fmc['message'])
+            if checksftunnel_status(FTD_TROUBLESHOOT_PATH, aq_data_fmc['create_time'],
+                                    aq_data_fmc['last_state_change']) == 0:
+                print("Suggested Component: comms")
+                return
+            print("Upgrade isn't triggered on ftd")
             print("Suggested Component: fleet_upgrade")
             return
-        if aq_data_fmc['message']:
-            print(aq_data_fmc['message'])
-        if checksftunnel_status(FTD_TROUBLESHOOT_PATH, aq_data_fmc['create_time'],
-                                aq_data_fmc['last_state_change']) == 0:
-            print("Suggested Component: comms")
-            return
-        print("Upgrade isn't triggered on ftd")
-        print("Suggested Component: fleet_upgrade")
-        return
 
     trigger_time_ftd = aq_data_ftd['create_time']
     end_time_ftd = aq_data_ftd['last_state_change']
 
-    if aq_data_fmc is not None:
+    if is_fmc_managed and aq_data_fmc is not None:
         trigger_time_fmc = aq_data_fmc['create_time']
         end_time_fmc = aq_data_fmc['last_state_change']
 
@@ -1135,7 +1142,7 @@ def main():
     # Get the last string in the upgrade_status.log
     file_path_log = FTD_TROUBLESHOOT_PATH + "/dir-archives/var-log/sf/" + package_folder + "/upgrade_status.log"
     with open(file_path_log, 'r') as file:
-        last_line = file.readlines()[-1].strip()
+        last_line = file.readlines()[-1].strip()  # Iterate till half from last
         if "The system will reboot after FXOS platform upgrade completes followed by a firmware upgrade." in last_line:
             print("FXOS upgrade is pending")
             print("Suggested Component: service-mgr")
@@ -1150,7 +1157,7 @@ def main():
             if "Confreg value: confreg =" in line:
                 confreg_value = line.split("confreg = ")[1].strip()
                 if confreg_value == "0x0":
-                    print("Confreg value is 0x0, confreg_val= " + confreg_value + ". This will hinder auto-boot")
+                    print("Confreg value is 0x0, confreg_val= " + confreg_value + ". This will hinder auto-boot. Please update the value.")
                     print("Suggested Component: Junk")
                     return
 
@@ -1201,12 +1208,13 @@ def main():
                     print("No issues with sftunnel, check with FMC team.")
                     print("Suggested Component: fleet_upgrade")
             return
-
-        deployment_file = FMC_TROUBLESHOOT_PATH+"/dir-archives/var-opt-CSCOpx-MDC-log-operation/usmsharedsvcs.log"
-        if checkdeploymentpostupgrade(deployment_file, date1 + " " + time1, end_time_fmc, [appliance_uuid, "failed"]) == 0:
-            print("Deployment failed post upgrade")
-            print("Suggested Component: policy_apply")
-            return
+        if is_fmc_managed:
+            deployment_file = FMC_TROUBLESHOOT_PATH + "/dir-archives/var-opt-CSCOpx-MDC-log-operation/usmsharedsvcs.log"
+            if checkdeploymentpostupgrade(deployment_file, date1 + " " + time1, end_time_fmc,
+                                          [appliance_uuid, "failed"]) == 0:
+                print("Deployment failed post upgrade")
+                print("Suggested Component: policy_apply")
+                return
 
         return
 
@@ -1219,7 +1227,7 @@ def main():
             if core == 1:
                 print("Suggested Component: asa")
                 print("To further identify the issue, collect core file from the device and upload to autopsy.")
-                print("Share the autopsy report with Lina team to understand the root cause and to identify the "
+                print("Share the autopsy report with Lina team[] to understand the root cause and to identify the "
                       "component.")
                 return
             elif core == 2:
